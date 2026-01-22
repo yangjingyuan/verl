@@ -319,6 +319,64 @@ For model-based rewards, implement a reward model worker in `verl/workers/reward
 - Hydra (configuration)
 - transformers, accelerate, peft (model utilities)
 
+## Git Configuration
+
+### SSH Setup
+
+This repository is configured to use SSH for git operations to avoid authentication issues in non-interactive environments.
+
+**Current configuration:**
+- Remote URL: `git@github.com:yangjingyuan/verl.git` (SSH format)
+- SSH key location: `~/.ssh/id_rsa`
+- Credential helper: `osxkeychain` (macOS)
+
+**If you need to switch from HTTPS to SSH:**
+```bash
+# Check current remote URL
+git remote -v
+
+# Change to SSH (if currently using HTTPS)
+git remote set-url origin git@github.com:yangjingyuan/verl.git
+
+# Verify the change
+git remote -v
+```
+
+**If push fails with authentication errors:**
+```bash
+# HTTPS authentication may fail in non-interactive mode
+# Solution: Use SSH instead (see above)
+
+# Alternatively, if you must use HTTPS, set up a personal access token
+git remote set-url origin https://github.com/yangjingyuan/verl.git
+# Then configure credential helper or use token in URL
+```
+
+**Verify SSH key is working:**
+```bash
+# Test SSH connection to GitHub
+ssh -T git@github.com
+# Expected output: "Hi username! You've successfully authenticated..."
+
+# List available SSH keys
+ls -la ~/.ssh/id_*.pub
+```
+
+**Standard git workflow:**
+```bash
+# Stage changes
+git add <files>
+
+# Commit with message
+git commit -m "descriptive message"
+
+# Push to remote (uses SSH)
+git push origin main
+
+# Pull latest changes
+git pull origin main
+```
+
 ## Additional Resources
 
 - Documentation: https://verl.readthedocs.io/
