@@ -20,6 +20,9 @@ GUI Agent trajectories, including:
 2. Coordinate proximity reward
 3. Task completion reward
 4. Format compliance reward
+
+Supports both interaction format (Action: click(x, y)) and
+legacy tool_call format (<tool_call>...</tool_call>).
 """
 
 import json
@@ -27,9 +30,106 @@ import re
 from typing import Any, Optional
 
 
+def extract_interaction_action(response_str: str) -> Optional[dict]:
+    """
+    Extract action from interaction format response.
+
+    Parses formats like:
+    - Action: click(500, 300)
+    - Action: swipe(100, 200, 300, 400)
+    - Action: type("hello")
+
+    Args:
+        response_str: The model's response string.
+
+    Returns:
+        Parsed action dict or None if not found.
+    """
+    # Find Action: line
+    action_pattern = r"Action:\s*(\w+)\s*\(([^)]*)\)"
+    match = re.search(action_pattern, response_str, re.IGNORECASE)
+
+    if not match:
+        return None
+
+    action_type = match.group(1).lower()
+    params_str = match.group(2).strip()
+
+    try:
+        if action_type == "click":
+            coords = _parse_coordinates(params_str)
+            if len(coords) >= 2:
+                return {"action": "click", "coordinate": [coords[0], coords[1]]}
+
+        elif action_type == "long_press":
+            parts = _parse_params(params_str)
+            if len(parts) >= 2:
+                coord = [int(float(parts[0])), int(float(parts[1]))]
+                time = float(parts[2]) if len(parts) > 2 else 1.0
+                return {"action": "long_press", "coordinate": coord, "time": time}
+
+        elif action_type == "swipe":
+            coords = _parse_coordinates(params_str)
+            if len(coords) >= 4:
+                return {
+                    "action": "swipe",
+                    "coordinate": [coords[0], coords[1]],
+                    "coordinate2": [coords[2], coords[3]],
+                }
+
+        elif action_type == "type":
+            text = _parse_text_param(params_str)
+            return {"action": "type", "text": text}
+
+        elif action_type == "answer":
+            text = _parse_text_param(params_str)
+            return {"action": "answer", "text": text}
+
+        elif action_type == "system_button":
+            button = _parse_text_param(params_str)
+            return {"action": "system_button", "button": button}
+
+        elif action_type == "wait":
+            parts = _parse_params(params_str)
+            time = float(parts[0]) if parts else 1.0
+            return {"action": "wait", "time": time}
+
+        elif action_type == "terminate":
+            status = _parse_text_param(params_str).lower()
+            if status not in ["success", "failure"]:
+                status = "success"
+            return {"action": "terminate", "status": status}
+
+    except (ValueError, IndexError):
+        return None
+
+    return None
+
+
+def _parse_coordinates(params_str: str) -> list[int]:
+    """Parse coordinate values from parameter string."""
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    return [int(float(p)) for p in parts]
+
+
+def _parse_params(params_str: str) -> list[str]:
+    """Parse comma-separated parameters."""
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    return [p.strip() for p in clean.split(",") if p.strip()]
+
+
+def _parse_text_param(params_str: str) -> str:
+    """Parse text parameter, handling quotes."""
+    quote_match = re.search(r'["\']([^"\']*)["\']', params_str)
+    if quote_match:
+        return quote_match.group(1)
+    return params_str.strip().strip('"').strip("'")
+
+
 def extract_tool_call(response_str: str) -> Optional[dict]:
     """
-    Extract tool call from response string.
+    Extract tool call from response string (legacy format).
 
     Args:
         response_str: The model's response string.
@@ -46,6 +146,30 @@ def extract_tool_call(response_str: str) -> Optional[dict]:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             return None
+
+    return None
+
+
+def extract_action(response_str: str) -> Optional[dict]:
+    """
+    Extract action from response string, supporting both interaction
+    and tool_call formats.
+
+    Args:
+        response_str: The model's response string.
+
+    Returns:
+        Parsed action dict or None if not found.
+    """
+    # Try interaction format first
+    action = extract_interaction_action(response_str)
+    if action is not None:
+        return action
+
+    # Fall back to tool_call format
+    tool_call = extract_tool_call(response_str)
+    if tool_call is not None:
+        return tool_call.get("arguments", {})
 
     return None
 
@@ -141,10 +265,9 @@ def format_reward(response_str: str) -> float:
     """
     Compute reward based on response format compliance.
 
-    Expected format:
-    1) Thought: <thought>
-    2) Action: <action>
-    3) <tool_call>...</tool_call>
+    Supports both interaction format and tool_call format:
+    - Interaction: Thought: <thought> + Action: action(params)
+    - Tool call: Thought: <thought> + Action: <desc> + <tool_call>...</tool_call>
 
     Args:
         response_str: The model's response string.
@@ -154,7 +277,7 @@ def format_reward(response_str: str) -> float:
     """
     score = 0.0
 
-    # Check for Thought section
+    # Check for Thought section (required for both formats)
     if re.search(r"Thought:", response_str, re.IGNORECASE):
         score += 0.25
 
@@ -162,14 +285,18 @@ def format_reward(response_str: str) -> float:
     if re.search(r"Action:", response_str, re.IGNORECASE):
         score += 0.25
 
-    # Check for tool_call tags
-    if re.search(r"<tool_call>", response_str) and re.search(r"</tool_call>", response_str):
-        score += 0.25
-
-    # Check for valid JSON in tool_call
-    tool_call = extract_tool_call(response_str)
-    if tool_call is not None:
-        score += 0.25
+    # Check for valid action (interaction format or tool_call format)
+    # Interaction format: Action: action_name(params)
+    interaction_action = extract_interaction_action(response_str)
+    if interaction_action is not None:
+        score += 0.5  # Full remaining score for valid interaction action
+    else:
+        # Fall back to tool_call format
+        if re.search(r"<tool_call>", response_str) and re.search(r"</tool_call>", response_str):
+            score += 0.25
+        tool_call = extract_tool_call(response_str)
+        if tool_call is not None:
+            score += 0.25
 
     return score
 
@@ -262,6 +389,9 @@ def compute_score(
     """
     Compute the overall reward score for a GUI Agent response.
 
+    Supports both interaction format (Action: click(x, y)) and
+    tool_call format (<tool_call>...</tool_call>).
+
     Args:
         predict_str: The model's response string.
         ground_truth: Ground truth dict containing 'action' and other fields.
@@ -276,14 +406,11 @@ def compute_score(
     # Compute format reward
     fmt_reward = format_reward(predict_str)
 
-    # Extract predicted action
-    tool_call = extract_tool_call(predict_str)
-    if tool_call is None:
-        # No valid tool call, only format reward
+    # Extract predicted action (supports both formats)
+    predicted = extract_action(predict_str)
+    if predicted is None:
+        # No valid action found, only format reward
         return format_weight * fmt_reward
-
-    # Get predicted arguments
-    predicted = tool_call.get("arguments", {})
 
     # Compute action reward
     act_reward = compute_action_reward(

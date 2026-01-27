@@ -20,17 +20,20 @@ the Qwen3-VL MobileAgent approach. It handles:
 2. Action prediction (click, swipe, type, etc.)
 3. Multi-turn interaction with the mobile environment
 4. Task completion assessment
+
+This implementation uses an interaction format instead of tool_use format:
+- Response format: Thought: <thinking> + Action: <action_type>(<params>)
+- Example: Action: click(500, 300)
 """
 
-import asyncio
-import json
 import logging
 import os
+import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
-import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -42,21 +45,145 @@ from verl.experimental.agent_loop.agent_loop import (
     DictConfigWrap,
     register,
 )
-from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.mobile_use_tool import (
     MobileAction,
-    MobileUseTool,
     SimulatedMobileEnvironment,
     TerminateStatus,
-    get_mobile_use_tool_schema,
 )
-from verl.tools.schemas import ToolResponse
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+@dataclass
+class ParsedAction:
+    """Parsed action from interaction format response."""
+
+    action_type: str
+    params: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary format."""
+        result = {"action": self.action_type}
+        result.update(self.params)
+        return result
+
+
+def parse_interaction_action(response_text: str) -> Optional[ParsedAction]:
+    """
+    Parse action from interaction format response.
+
+    Supported formats:
+    - Action: click(x, y)
+    - Action: long_press(x, y, time)
+    - Action: swipe(x1, y1, x2, y2)
+    - Action: type("text")
+    - Action: answer("text")
+    - Action: system_button(button_name)
+    - Action: wait(seconds)
+    - Action: terminate(status)
+
+    Args:
+        response_text: The model's response string.
+
+    Returns:
+        ParsedAction object or None if parsing fails.
+    """
+    # Find Action: line
+    action_pattern = r"Action:\s*(\w+)\s*\(([^)]*)\)"
+    match = re.search(action_pattern, response_text, re.IGNORECASE)
+
+    if not match:
+        return None
+
+    action_type = match.group(1).lower()
+    params_str = match.group(2).strip()
+
+    try:
+        if action_type == "click":
+            # click(x, y)
+            coords = _parse_coordinates(params_str)
+            if len(coords) >= 2:
+                return ParsedAction(action_type="click", params={"coordinate": [coords[0], coords[1]]})
+
+        elif action_type == "long_press":
+            # long_press(x, y, time) or long_press(x, y)
+            parts = _parse_params(params_str)
+            if len(parts) >= 2:
+                coord = [int(float(parts[0])), int(float(parts[1]))]
+                time = float(parts[2]) if len(parts) > 2 else 1.0
+                return ParsedAction(action_type="long_press", params={"coordinate": coord, "time": time})
+
+        elif action_type == "swipe":
+            # swipe(x1, y1, x2, y2)
+            coords = _parse_coordinates(params_str)
+            if len(coords) >= 4:
+                return ParsedAction(
+                    action_type="swipe",
+                    params={"coordinate": [coords[0], coords[1]], "coordinate2": [coords[2], coords[3]]},
+                )
+
+        elif action_type == "type":
+            # type("text") or type(text)
+            text = _parse_text_param(params_str)
+            return ParsedAction(action_type="type", params={"text": text})
+
+        elif action_type == "answer":
+            # answer("text") or answer(text)
+            text = _parse_text_param(params_str)
+            return ParsedAction(action_type="answer", params={"text": text})
+
+        elif action_type == "system_button":
+            # system_button(Back) or system_button("Back")
+            button = _parse_text_param(params_str)
+            return ParsedAction(action_type="system_button", params={"button": button})
+
+        elif action_type == "wait":
+            # wait(seconds)
+            parts = _parse_params(params_str)
+            time = float(parts[0]) if parts else 1.0
+            return ParsedAction(action_type="wait", params={"time": time})
+
+        elif action_type == "terminate":
+            # terminate(success) or terminate(failure)
+            status = _parse_text_param(params_str).lower()
+            if status not in ["success", "failure"]:
+                status = "success"
+            return ParsedAction(action_type="terminate", params={"status": status})
+
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Failed to parse action params: {e}")
+        return None
+
+    return None
+
+
+def _parse_coordinates(params_str: str) -> list[int]:
+    """Parse coordinate values from parameter string."""
+    # Remove quotes and brackets
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    # Split by comma and convert to integers
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    return [int(float(p)) for p in parts]
+
+
+def _parse_params(params_str: str) -> list[str]:
+    """Parse comma-separated parameters."""
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    return [p.strip() for p in clean.split(",") if p.strip()]
+
+
+def _parse_text_param(params_str: str) -> str:
+    """Parse text parameter, handling quotes."""
+    # Try to extract quoted string first
+    quote_match = re.search(r'["\']([^"\']*)["\']', params_str)
+    if quote_match:
+        return quote_match.group(1)
+    # Otherwise return stripped string
+    return params_str.strip().strip('"').strip("'")
 
 
 class GUIAgentState(Enum):
@@ -109,7 +236,7 @@ class GUIAgentData:
         self.action_rewards: list[float] = []
 
         # Current action being processed
-        self.current_action: Optional[FunctionCall] = None
+        self.current_action: Optional[ParsedAction] = None
 
         # Environment state
         self.environment: Optional[SimulatedMobileEnvironment] = None
@@ -168,44 +295,48 @@ class GUIAgentLoop(AgentLoopBase):
         self.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         self.response_length = config.actor_rollout_ref.rollout.response_length
 
-        # Tool parser for extracting function calls
-        tool_parser_format = multi_turn_config.get("format", "qwen")
-        self.tool_parser = ToolParser.get_tool_parser(tool_parser_format, self.tokenizer)
-
-        # Tool schema
-        self.tool_schema = get_mobile_use_tool_schema(self.screen_width, self.screen_height)
-        self.tool_schemas = [self.tool_schema.model_dump(exclude_unset=True, exclude_none=True)]
-
     def _build_system_prompt(self) -> str:
-        """Build the system prompt for GUI Agent."""
-        return f"""
+        """Build the system prompt for GUI Agent using interaction format."""
+        return f"""You are a GUI agent that interacts with a mobile device touchscreen.
 
-# Tools
+# Screen Information
+- Screen resolution: {self.screen_width}x{self.screen_height}
+- Coordinates: (x, y) where x is pixels from left edge, y is pixels from top edge
 
-You may call one or more functions to assist with the user query.
+# Available Actions
+- click(x, y): Click at position (x, y)
+- long_press(x, y, time): Long press at (x, y) for specified seconds (default: 1.0)
+- swipe(x1, y1, x2, y2): Swipe from (x1, y1) to (x2, y2)
+- type("text"): Input text into the current input field
+- answer("text"): Output the answer to the user's question
+- system_button(button): Press system button (Back, Home, Menu, Enter)
+- wait(seconds): Wait for specified seconds
+- terminate(status): End task with status (success or failure)
 
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{json.dumps(self.tool_schema.model_dump(exclude_unset=True, exclude_none=True), indent=2)}
-</tools>
+# Response Format
+For every step, respond in exactly this format:
+Thought: <one concise sentence explaining your reasoning>
+Action: <action_name>(<parameters>)
 
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{{"name": <function-name>, "arguments": <args-json-object>}}
-</tool_call>
+# Examples
+Thought: I need to tap the search icon to open search.
+Action: click(450, 120)
 
-# Response format
+Thought: I need to scroll down to see more content.
+Action: swipe(500, 700, 500, 200)
 
-Response format for every step:
-1) Thought: one concise sentence explaining the next move (no multi-step reasoning).
-2) Action: a short imperative describing what to do in the UI.
-3) A single <tool_call>...</tool_call> block containing only the JSON: {{"name": <function-name>, "arguments": <args-json-object>}}.
+Thought: I need to enter the search query.
+Action: type("weather forecast")
 
-Rules:
-- Output exactly in the order: Thought, Action, <tool_call>.
-- Be brief: one sentence for Thought, one for Action.
-- Do not output anything else outside those three parts.
-- If finishing, use action=terminate in the tool call."""
+Thought: The task is complete, I found the information.
+Action: terminate(success)
+
+# Rules
+- Always output Thought first, then Action on the next line
+- Be concise: one sentence for Thought
+- Click the center of UI elements, not their edges
+- Wait when needed for UI to respond
+- Use terminate(success) when task is done, terminate(failure) if stuck"""
 
     def _build_task_history(self, action_history: list[dict]) -> str:
         """Build task progress history string."""
@@ -329,7 +460,7 @@ Rules:
         sampling_params: dict[str, Any],
     ) -> GUIAgentState:
         """Handle the pending state: build initial prompt."""
-        # Build system message with tool schema
+        # Build system message
         system_content = self._build_system_prompt()
 
         # Build user query with task progress
@@ -352,10 +483,10 @@ Rules:
 
         agent_data.messages = messages
 
-        # Apply chat template
+        # Apply chat template (no tools parameter for interaction format)
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
-            tools=self.tool_schemas,
+            tools=None,
             images=agent_data.image_data,
             videos=None,
         )
@@ -404,14 +535,15 @@ Rules:
         if agent_data.user_turns >= self.max_user_turns:
             return GUIAgentState.TERMINATED
 
-        # Extract tool calls
-        _, tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        # Decode response and extract action using interaction format
+        response_text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+        parsed_action = parse_interaction_action(response_text)
 
-        if tool_calls:
-            agent_data.current_action = tool_calls[0]  # Process one action at a time
+        if parsed_action:
+            agent_data.current_action = parsed_action
             return GUIAgentState.PROCESSING_ACTION
         else:
-            # No tool call found, terminate
+            # No valid action found, terminate
             return GUIAgentState.TERMINATED
 
     async def _handle_processing_action_state(self, agent_data: GUIAgentData) -> GUIAgentState:
@@ -419,14 +551,10 @@ Rules:
         if agent_data.current_action is None:
             return GUIAgentState.TERMINATED
 
-        with simple_timer("tool_calls", agent_data.metrics):
-            # Parse action parameters
-            try:
-                action_params = json.loads(agent_data.current_action.arguments)
-            except json.JSONDecodeError:
-                action_params = {}
-
-            action_type = action_params.get("action", "")
+        with simple_timer("action_execution", agent_data.metrics):
+            # Get action parameters from ParsedAction
+            action_params = agent_data.current_action.to_dict()
+            action_type = agent_data.current_action.action_type
 
             # Execute action on environment
             env = agent_data.environment
@@ -499,17 +627,17 @@ Rules:
             if new_screenshot is not None and self.return_screenshot:
                 agent_data.image_data.append(new_screenshot)
 
-            # Build tool response message
-            tool_response_content = [{"type": "text", "text": result_text}]
+            # Build observation message (using user role for interaction format)
+            observation_content = [{"type": "text", "text": f"Observation: {result_text}"}]
             if new_screenshot is not None and self.return_screenshot:
-                tool_response_content.insert(0, {"type": "image"})
+                observation_content.insert(0, {"type": "image"})
 
-            tool_message = {"role": "tool", "content": tool_response_content}
-            agent_data.messages.append(tool_message)
+            observation_message = {"role": "user", "content": observation_content}
+            agent_data.messages.append(observation_message)
 
-            # Tokenize tool response
+            # Tokenize observation message
             response_ids = await self.apply_chat_template(
-                [tool_message],
+                [observation_message],
                 images=[new_screenshot] if new_screenshot is not None else None,
                 videos=None,
                 remove_system_prompt=True,
@@ -521,7 +649,7 @@ Rules:
 
             # Update state
             agent_data.prompt_ids += response_ids
-            agent_data.response_mask += [0] * len(response_ids)  # Tool responses are masked
+            agent_data.response_mask += [0] * len(response_ids)  # Observation responses are masked
             if agent_data.response_logprobs:
                 agent_data.response_logprobs += [0.0] * len(response_ids)
 
