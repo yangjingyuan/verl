@@ -112,10 +112,14 @@ python3 -m verl.trainer.main_ppo \
     `# ==================== Multi-turn Configuration ====================` \
     +actor_rollout_ref.rollout.multi_turn.max_user_turns=20 \
     +actor_rollout_ref.rollout.multi_turn.max_assistant_turns=20 \
-    +actor_rollout_ref.rollout.multi_turn.format=qwen \
+    +actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1 \
+    +actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2000 \
+    +actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side=right \
+    +actor_rollout_ref.rollout.multi_turn.format=interaction \
+    +actor_rollout_ref.rollout.multi_turn.tool_config_path=examples/gui_agent/tool_config.yaml \
     \
     `# ==================== Agent Loop Configuration ====================` \
-    +actor_rollout_ref.rollout.agent.default_agent_loop=gui_agent \
+    +actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     +actor_rollout_ref.rollout.agent.num_workers=8 \
     \
     `# ==================== Reference Model Configuration ====================` \

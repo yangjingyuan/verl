@@ -47,22 +47,31 @@ Implements the mobile device interaction interface:
 - **Coordinate System**: Normalized to screen dimensions (default 999x999)
 - **Screenshot Handling**: Returns screenshots after actions for visual feedback
 
-### 2. GUI Agent Loop (`verl/experimental/agent_loop/gui_agent_loop.py`)
+### 2. Tool Agent Loop with Interaction Format (`verl/experimental/agent_loop/tool_agent_loop.py`)
 
-Handles the multi-turn interaction workflow:
+The GUI Agent reuses the unified Tool Agent Loop with `format=interaction`:
 
-- State machine: PENDING → GENERATING → PROCESSING_ACTION → TERMINATED
-- Tool call extraction and execution
+- State machine: PENDING → GENERATING → PROCESSING_TOOLS → TERMINATED
+- Supports interaction format: `Action: click(x, y)` instead of XML tool_call
+- Tool call extraction via `InteractionToolParser`
 - Response masking for GRPO training
 
-### 3. Reward Function (`verl/utils/reward_score/gui_agent.py`)
+### 3. Interaction Tool Parser (`verl/experimental/agent_loop/tool_parser.py`)
+
+Parses the interaction format responses:
+
+- Extracts actions from `Action: action_name(params)` format
+- Converts to standard `FunctionCall` for tool execution
+- Supports all mobile actions (click, swipe, type, etc.)
+
+### 4. Reward Function (`verl/utils/reward_score/gui_agent.py`)
 
 Computes rewards based on:
 
 - Action type accuracy
 - Coordinate proximity (for click/swipe actions)
 - Text similarity (for type actions)
-- Format compliance (Thought → Action → tool_call)
+- Format compliance (Thought → Action)
 - Task completion bonus
 
 ## Data Format
@@ -166,14 +175,23 @@ algorithm.use_kl_in_reward=False
 
 ## Response Format
 
-The model should generate responses in the following format:
+The model should generate responses in the interaction format:
 
 ```
 Thought: I need to click on the search icon to open the search bar.
-Action: Click on the search icon at the top right.
-<tool_call>
-{"name": "mobile_use", "arguments": {"action": "click", "coordinate": [850, 50]}}
-</tool_call>
+Action: click(850, 50)
+```
+
+Other action examples:
+```
+Thought: I need to scroll down to see more content.
+Action: swipe(500, 700, 500, 200)
+
+Thought: I need to enter the search query.
+Action: type("weather forecast")
+
+Thought: The task is complete.
+Action: terminate(success)
 ```
 
 ## Datasets

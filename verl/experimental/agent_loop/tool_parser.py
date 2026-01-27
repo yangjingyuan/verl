@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from typing import Any, Optional
 
 import regex
 from pydantic import BaseModel
@@ -24,6 +25,27 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _parse_coordinates(params_str: str) -> list[int]:
+    """Parse coordinate values from parameter string."""
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    return [int(float(p)) for p in parts]
+
+
+def _parse_params(params_str: str) -> list[str]:
+    """Parse comma-separated parameters."""
+    clean = params_str.replace('"', "").replace("'", "").replace("[", "").replace("]", "")
+    return [p.strip() for p in clean.split(",") if p.strip()]
+
+
+def _parse_text_param(params_str: str) -> str:
+    """Parse text parameter, handling quotes."""
+    quote_match = regex.search(r'["\']([^"\']*)["\']', params_str)
+    if quote_match:
+        return quote_match.group(1)
+    return params_str.strip().strip('"').strip("'")
 
 
 class FunctionCall(BaseModel):
@@ -159,3 +181,112 @@ class GptOssToolParser(ToolParser):
         content = regex.sub(self.tool_call_pattern, "", text)
 
         return content, function_calls
+
+
+@ToolParser.register("interaction")
+class InteractionToolParser(ToolParser):
+    """
+    Tool parser for interaction format used by GUI agents.
+
+    This parser extracts actions from the format:
+    Thought: <reasoning>
+    Action: <action_name>(<parameters>)
+
+    Supported actions:
+    - click(x, y)
+    - long_press(x, y, time)
+    - swipe(x1, y1, x2, y2)
+    - type("text")
+    - answer("text")
+    - system_button(button_name)
+    - wait(seconds)
+    - terminate(status)
+    """
+
+    def __init__(self, tokenizer, tool_name: str = "mobile_use") -> None:
+        super().__init__(tokenizer)
+        self.tool_name = tool_name
+        self.action_pattern = regex.compile(r"Action:\s*(\w+)\s*\(([^)]*)\)", regex.IGNORECASE)
+
+    def _parse_action_to_function_call(self, action_type: str, params_str: str) -> Optional[FunctionCall]:
+        """Parse action into FunctionCall format for mobile_use tool."""
+        action_type = action_type.lower()
+        arguments: dict[str, Any] = {"action": action_type}
+
+        try:
+            if action_type == "click":
+                coords = _parse_coordinates(params_str)
+                if len(coords) >= 2:
+                    arguments["coordinate"] = [coords[0], coords[1]]
+                else:
+                    return None
+
+            elif action_type == "long_press":
+                parts = _parse_params(params_str)
+                if len(parts) >= 2:
+                    arguments["coordinate"] = [int(float(parts[0])), int(float(parts[1]))]
+                    if len(parts) > 2:
+                        arguments["time"] = float(parts[2])
+                else:
+                    return None
+
+            elif action_type == "swipe":
+                coords = _parse_coordinates(params_str)
+                if len(coords) >= 4:
+                    arguments["coordinate"] = [coords[0], coords[1]]
+                    arguments["coordinate2"] = [coords[2], coords[3]]
+                else:
+                    return None
+
+            elif action_type == "type":
+                text = _parse_text_param(params_str)
+                arguments["text"] = text
+
+            elif action_type == "answer":
+                text = _parse_text_param(params_str)
+                arguments["text"] = text
+
+            elif action_type == "system_button":
+                button = _parse_text_param(params_str)
+                arguments["button"] = button
+
+            elif action_type == "wait":
+                parts = _parse_params(params_str)
+                time_val = float(parts[0]) if parts else 1.0
+                arguments["time"] = time_val
+
+            elif action_type == "terminate":
+                status = _parse_text_param(params_str).lower()
+                if status not in ["success", "failure"]:
+                    status = "success"
+                arguments["status"] = status
+
+            else:
+                logger.warning(f"Unknown action type: {action_type}")
+                return None
+
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Failed to parse action params: {e}")
+            return None
+
+        return FunctionCall(name=self.tool_name, arguments=json.dumps(arguments, ensure_ascii=False))
+
+    @rollout_trace_op
+    async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+        loop = get_event_loop()
+        text = await loop.run_in_executor(None, lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=True))
+
+        match = self.action_pattern.search(text)
+        if not match:
+            return text, []
+
+        action_type = match.group(1)
+        params_str = match.group(2).strip()
+
+        function_call = self._parse_action_to_function_call(action_type, params_str)
+        if function_call:
+            # Remove the action from text to get content
+            content = self.action_pattern.sub("", text).strip()
+            return content, [function_call]
+
+        return text, []

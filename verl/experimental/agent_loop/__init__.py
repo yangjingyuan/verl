@@ -15,8 +15,8 @@
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
-from .gui_agent_loop import GUIAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, GUIAgentLoop]
+# Ensure agent loops are registered
+_ = [SingleTurnAgentLoop, ToolAgentLoop]
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "GUIAgentLoop"]
+__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "ToolAgentLoop"]
