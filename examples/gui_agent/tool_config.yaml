@@ -1,0 +1,58 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# Tool Configuration for GUI Agent
+# =============================================================================
+# This configuration file defines the tools available to the GUI Agent.
+# The primary tool is mobile_use for interacting with mobile device screens.
+# =============================================================================
+
+tools:
+  - class_name: verl.tools.mobile_use_tool.MobileUseTool
+    config:
+      type: native
+      # Screen dimensions for coordinate normalization
+      screen_width: 999
+      screen_height: 999
+      # Whether to return screenshots after each action
+      return_screenshot: true
+    # Tool schema is auto-generated based on screen dimensions
+    # You can override it here if needed:
+    # tool_schema:
+    #   type: function
+    #   function:
+    #     name: mobile_use
+    #     description: "Use a touchscreen to interact with a mobile device..."
+    #     parameters:
+    #       type: object
+    #       properties:
+    #         action:
+    #           type: string
+    #           enum: [click, long_press, swipe, type, answer, system_button, wait, terminate]
+    #         coordinate:
+    #           type: array
+    #         coordinate2:
+    #           type: array
+    #         text:
+    #           type: string
+    #         time:
+    #           type: number
+    #         button:
+    #           type: string
+    #           enum: [Back, Home, Menu, Enter]
+    #         status:
+    #           type: string
+    #           enum: [success, failure]
+    #       required: [action]
